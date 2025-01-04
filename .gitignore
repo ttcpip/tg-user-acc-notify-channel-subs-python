@@ -1,3 +1,6 @@
 *.session
+*.session-journal
 *.tmp.*
 .env
+
+subs.json

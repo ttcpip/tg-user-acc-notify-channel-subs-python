@@ -1,9 +1,11 @@
 import asyncio
 import os
 import logging
+import json
+
 
 from telethon import TelegramClient, events, errors
-from telethon.sessions import StringSession
+# from telethon.sessions import StringSession  # УДАЛЯЕМ, т.к. не используется
 from dotenv import load_dotenv
 
 # Загружаем .env
@@ -12,15 +14,15 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 
 # Читаем переменные из .env
-# int, например 123456
-API_ID = int(os.getenv("TG_API_ID", "123456"))
+API_ID = int(os.getenv("TG_API_ID", "123456")
+             )            # int, например 123456
 # str, например "abcdef0123456789..."
 API_HASH = os.getenv("TG_API_HASH", "ABC123...")
-BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "123456:ABC-...")    # Токен бота
+BOT_TOKEN = os.getenv("TG_BOT_TOKEN", "123456:ABC-...")   # Токен бота
 # Чат, из которого принимаем команды и куда слать уведомления
 ADMIN_CHAT_ID = int(os.getenv("TG_ADMIN_CHAT_ID", "0"))
 
-# Названия (или пути к) файловых/строковых сессий
+# Названия (или пути к) файлов/строк-сессий
 SESSION_NAME_USER = os.getenv("TG_USER_SESSION_NAME", "user_account.session")
 SESSION_NAME_BOT = os.getenv("TG_BOT_SESSION_NAME", "bot_account.session")
 
@@ -29,11 +31,10 @@ user_client = None
 bot = None
 current_channel_id = None
 
+
 # ------------------------------------------------------------------------------
 # ИНИЦИАЛИЗАЦИЯ
 # ------------------------------------------------------------------------------
-
-
 async def init_clients():
     """
     Инициализирует бота и клиентский аккаунт (пользовательский).
@@ -55,7 +56,7 @@ async def init_clients():
         API_HASH
     )
     # user_client не запускаем сразу через start(phone=...),
-    # потому что авторизация будет по команде /login
+    # потому что авторизация будет через /login
     await user_client.connect()
 
 
@@ -63,7 +64,7 @@ async def init_clients():
 # ОБРАБОТЧИКИ СОБЫТИЙ ДЛЯ ПОДПИСКИ/ОТПИСКИ
 # ------------------------------------------------------------------------------
 @events.register(events.ChatAction)
-async def on_chat_action(event):
+async def on_chat_action(event: events.chataction.ChatAction.Event):
     """
     Срабатывает, когда пользователь:
      - вступил (user_joined)
@@ -72,10 +73,13 @@ async def on_chat_action(event):
      - был удалён (user_kicked)
     и т.д.
 
-    Мы проверяем, что событие относится к каналу, за которым следим (current_channel_id).
+    Проверяем, что событие относится к каналу, за которым следим (current_channel_id).
     Получаем подробную информацию о канале и пользователе, отправляем уведомление в ADMIN_CHAT_ID.
     """
     global current_channel_id
+
+    logging.info(
+        f"Пришло событие ChatAction event.chat_id={event.chat_id}: {event.stringify()}\n")
 
     if current_channel_id is None:
         return  # Канал для отслеживания не задан
@@ -83,8 +87,7 @@ async def on_chat_action(event):
     if event.chat_id != current_channel_id:
         return  # Событие не в том канале
 
-    # Если у нас нет связи с user_client (он не авторизован),
-    # не сможем получить детали о канале/пользователе.
+    # Если нет связи с user_client (он не авторизован) — выходим
     if not user_client.is_connected() or not (await user_client.is_user_authorized()):
         return
 
@@ -132,8 +135,7 @@ async def on_chat_action(event):
     msg = (f"Зафиксирована {action_text} от канала @{channel_username}, "
            f"пользователь: @{user_username} {user_first_name} {user_last_name} (id{user_id})")
 
-    # Отправляем в ADMIN_CHAT_ID
-    # (при условии, что ADMIN_CHAT_ID != 0)
+    # Отправляем в ADMIN_CHAT_ID (если он не 0)
     if ADMIN_CHAT_ID != 0:
         try:
             await bot.send_message(ADMIN_CHAT_ID, msg)
@@ -143,8 +145,19 @@ async def on_chat_action(event):
 
 
 # ------------------------------------------------------------------------------
+# ОБРАБОТЧИКИ СОБЫТИЙ ДЛЯ ПОДПИСКИ/ОТПИСКИ
+# ------------------------------------------------------------------------------
+@events.register(events.Raw)
+async def mytest_on_update(update):
+    # Print all incoming updates
+    # logging.info(f"New update: {update.stringify()}\n\n")
+    pass
+
+# ------------------------------------------------------------------------------
 # ПРОВЕРКА ДОСТУПА К КОМАНДАМ
 # ------------------------------------------------------------------------------
+
+
 def admin_only(func):
     """
     Декоратор, который проверяет, что команда пришла из ADMIN_CHAT_ID.
@@ -167,12 +180,13 @@ async def cmd_start(event):
     text = (
         "Привет! Я бот для отслеживания подписок/отписок канала.\n\n"
         "Доступные команды:\n"
-        "/login – Войти в аккаунт\n"
+        "/login – Войти в аккаунт (интерактивно)\n"
         "/logout – Выйти из аккаунта\n"
         "/status – Проверить, авторизован ли аккаунт\n"
         "/setchannel <ID> – Установить ID канала\n"
         "/getchannelid <@username> – Получить numeric ID канала по его username\n"
         "/subcount – Узнать, сколько подписчиков\n"
+        "/id – Узнать текущий chat_id (или user_id)\n"
     )
     await event.respond(text)
 
@@ -181,68 +195,83 @@ async def cmd_start(event):
 @admin_only
 async def cmd_login(event):
     """
-    /login — Запрос номера телефона и кода для авторизации 
-    (если уже авторизованы, скажет об этом)
+    /login — Запрашиваем номер телефона и код для авторизации.
+    Вместо pattern=... используем ручную проверку результата get_response().
     """
     global user_client
 
+    # Если уже авторизованы
     if user_client.is_connected() and (await user_client.is_user_authorized()):
         await event.respond("Аккаунт уже авторизован.")
         return
 
-    await event.respond("Окей, давайте авторизуемся. Вышлите свой номер телефона в формате +71234567890:")
+    # Начинаем "conversation"
+    async with bot.conversation(event.chat_id, exclusive=False) as conv:
+        await conv.send_message(
+            "Окей, давайте авторизуемся. Введите номер телефона, начиная с '+':"
+        )
 
-    # Ждём ответа с номером телефона
-    phone_event = await bot.wait_for_event(
-        events.NewMessage(chats=event.chat_id,
-                          func=lambda e: e.raw_text.startswith('+'))
-    )
-    phone_number = phone_event.raw_text.strip()
+        # 1) Получаем телефон
+        while True:
+            phone_event = await conv.get_response()
+            phone_number = phone_event.raw_text.strip()
+            if phone_number.startswith('+'):
+                # Всё окей, выходим из цикла
+                break
+            else:
+                await conv.send_message("Номер должен начинаться с '+'. Попробуйте ещё раз.")
 
-    # Начинаем авторизацию
-    try:
-        await user_client.connect()
+        try:
+            # Подключаемся к клиенту
+            await user_client.connect()
 
-        if not await user_client.is_user_authorized():
-            await user_client.send_code_request(phone_number)
-            await event.respond(f"Код отправлен на номер {phone_number}. Введите код:")
+            # Если не авторизованы — запрашиваем код
+            if not await user_client.is_user_authorized():
+                await user_client.send_code_request(phone_number)
+                await conv.send_message(
+                    f"Код отправлен на номер {phone_number}. Введите код (только цифры):"
+                )
 
-            code_event = await bot.wait_for_event(
-                events.NewMessage(chats=event.chat_id,
-                                  func=lambda e: e.raw_text.isdigit())
-            )
-            code = code_event.raw_text.strip()
+                # 2) Получаем код (проверяем, что введены только цифры)
+                while True:
+                    code_event = await conv.get_response()
+                    code = code_event.raw_text.strip()
+                    if code.isdigit():
+                        break
+                    else:
+                        await conv.send_message("Код должен состоять только из цифр. Повторите ввод.")
 
-            try:
-                # Если включена 2FA, Telethon попросит пароль отдельно
-                await user_client.sign_in(phone_number, code)
-                await event.respond("Успешно авторизовались!")
-            except errors.SessionPasswordNeededError:
-                await event.respond("Введите пароль от аккаунта (2FA):")
-                pass_event = await bot.wait_for_event(events.NewMessage(chats=event.chat_id))
-                password_2fa = pass_event.raw_text.strip()
+                # Пытаемся войти
+                try:
+                    await user_client.sign_in(phone_number, code)
+                    await conv.send_message("Успешно авторизовались!")
+                except errors.SessionPasswordNeededError:
+                    # Если включена 2FA, просим пароль
+                    await conv.send_message("Введите пароль (2FA):")
+                    pass_event = await conv.get_response()
+                    password_2fa = pass_event.raw_text.strip()
 
-                await user_client.sign_in(password=password_2fa)
-                await event.respond("Успешно авторизовались (с 2FA)!")
-        else:
-            await event.respond("Уже авторизовано.")
+                    await user_client.sign_in(password=password_2fa)
+                    await conv.send_message("Успешно авторизовались (с 2FA)!")
+            else:
+                await conv.send_message("Уже авторизовано.")
 
-    except Exception as ex:
-        await event.respond(f"Ошибка при авторизации: {ex}")
+        except Exception as ex:
+            await conv.send_message(f"Ошибка при авторизации: {ex}")
 
 
 @events.register(events.NewMessage(pattern=r'^/logout$'))
 @admin_only
 async def cmd_logout(event):
     """
-    /logout — Разлогинивает аккаунт и удаляет сохранённую сессию
+    /logout — Разлогинивает аккаунт и удаляет сохранённую сессию.
     """
     global user_client
 
     if user_client.is_connected() and await user_client.is_user_authorized():
         await user_client.log_out()
         await user_client.disconnect()
-        await event.respond("Аккаунт разлогинен. Сессионный файл останется на сервере, можете удалить вручную.")
+        await event.respond("Аккаунт разлогинен. Сессионный файл останется на сервере (при необходимости удалите вручную).")
     else:
         await event.respond("Аккаунт не авторизован (или уже разлогинен).")
 
@@ -311,12 +340,39 @@ async def cmd_subcount(event):
         return
 
     try:
-        # Получаем список участников канала
         participants = await user_client.get_participants(current_channel_id)
         count = len(participants)
+        logging.info(f"Subs: {str(participants)}")
         await event.respond(f"Сейчас в канале {count} подписчиков.")
+
+        def user_to_dict(user):
+            return {
+                "id": user.id,
+                "bot": user.bot,
+                "first_name": user.first_name,
+                "last_name": user.last_name,
+                "username": user.username
+            }
+        with open('subs.json', 'w', encoding='utf-8') as f:
+            json.dump([user_to_dict(user) for user in participants],
+                      f, ensure_ascii=False, indent=4)
     except Exception as e:
         await event.respond(f"Ошибка при получении количества подписчиков: {e}")
+
+
+@events.register(events.NewMessage(pattern=r'^/id$'))
+async def cmd_id(event):
+    """
+    /id — Узнать, какой chat_id (или user_id) у текущего диалога
+    """
+    # При желании можно ограничить доступ декоратором @admin_only
+    # но пользовательский код выше сделан без него, поэтому оставим так
+    chat_id = event.chat_id
+    # Можно вывести также id текущего отправителя
+    sender = await event.get_sender()
+    sender_id = sender.id if sender else "unknown_sender"
+
+    await event.respond(f"Эта команда пришла из chat_id={chat_id}, ваш user_id={sender_id}")
 
 
 # ------------------------------------------------------------------------------
@@ -336,7 +392,9 @@ async def main():
     bot.add_event_handler(cmd_setchannel)
     bot.add_event_handler(cmd_getchannelid)
     bot.add_event_handler(cmd_subcount)
+    bot.add_event_handler(cmd_id)
 
+    user_client.add_event_handler(mytest_on_update)
     user_client.add_event_handler(on_chat_action)
 
     # Работаем вечно
