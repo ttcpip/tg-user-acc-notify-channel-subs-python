@@ -2,5 +2,6 @@
 *.session-journal
 *.tmp.*
 .env
+telegram_bot.db
 
 subs.json

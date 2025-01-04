@@ -1,17 +1,25 @@
 import asyncio
 import os
 import logging
-import json
-
+import aiosqlite
+from datetime import datetime, timezone
+import signal
+import sys
 
 from telethon import TelegramClient, events, errors
-# from telethon.sessions import StringSession  # УДАЛЯЕМ, т.к. не используется
 from dotenv import load_dotenv
 
 # Загружаем .env
 load_dotenv()
 
-logging.basicConfig(level=logging.INFO)
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.StreamHandler()
+    ]
+)
 
 # Читаем переменные из .env
 API_ID = int(os.getenv("TG_API_ID", "123456")
@@ -26,20 +34,123 @@ ADMIN_CHAT_ID = int(os.getenv("TG_ADMIN_CHAT_ID", "0"))
 SESSION_NAME_USER = os.getenv("TG_USER_SESSION_NAME", "user_account.session")
 SESSION_NAME_BOT = os.getenv("TG_BOT_SESSION_NAME", "bot_account.session")
 
+# Настройки polling
+POLLING_INTERVAL_SECONDS = int(
+    os.getenv("POLLING_INTERVAL_SECONDS", "60"))  # Интервал в секундах
+# Путь к SQLite базе данных
+DATABASE_PATH = os.getenv("DATABASE_PATH", "telegram_bot.db")
+
 # Глобальные переменные
 user_client = None
 bot = None
 current_channel_id = None
+db = None  # Экземпляр базы данных aiosqlite
 
+# ------------------------------------------------------------------------------
+# DATABASE HANDLING
+# ------------------------------------------------------------------------------
+
+
+async def init_db():
+    """Инициализирует базу данных и создаёт необходимые таблицы."""
+    global db
+    db = await aiosqlite.connect(DATABASE_PATH)
+    await db.execute("""
+    CREATE TABLE IF NOT EXISTS channel (
+        id INTEGER PRIMARY KEY,
+        tg_id INTEGER UNIQUE,
+        name TEXT,
+        username TEXT
+    )
+    """)
+
+    await db.execute("""
+    CREATE TABLE IF NOT EXISTS subscribers (
+        user_tg_id INTEGER PRIMARY KEY,
+        username TEXT,
+        first_name TEXT,
+        last_name TEXT
+    )
+    """)
+
+    await db.execute("""
+    CREATE TABLE IF NOT EXISTS actions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_tg_id INTEGER,
+        user_tg_username TEXT,
+        user_tg_name TEXT,
+        user_tg_surname TEXT,
+        action TEXT CHECK(action IN ('SUBSCRIBED', 'UNSUBSCRIBED')),
+        time_utc TEXT,
+        channel_tg_id INTEGER
+    )
+    """)
+
+    await db.commit()
+
+
+async def get_tracked_channel():
+    """Получает информацию о текущем отслеживаемом канале."""
+    async with db.execute("SELECT tg_id, name, username FROM channel LIMIT 1") as cursor:
+        row = await cursor.fetchone()
+    if row:
+        return {'tg_id': row[0], 'name': row[1], 'username': row[2]}
+    return None
+
+
+async def set_tracked_channel(tg_id, name, username):
+    """Устанавливает отслеживаемый канал, очищает предыдущих подписчиков."""
+    await db.execute("DELETE FROM channel")
+    await db.execute("INSERT INTO channel (tg_id, name, username) VALUES (?, ?, ?)", (tg_id, name, username))
+    # Очистка предыдущих подписчиков
+    await db.execute("DELETE FROM subscribers")
+    await db.commit()
+
+
+async def get_stored_subscribers():
+    """Возвращает список всех подписчиков из базы данных."""
+    async with db.execute("SELECT user_tg_id, username, first_name, last_name FROM subscribers") as cursor:
+        rows = await cursor.fetchall()
+    return {row[0]: {'username': row[1], 'first_name': row[2], 'last_name': row[3]} for row in rows}
+
+
+async def add_subscriber(user):
+    """Добавляет нового подписчика в базу данных."""
+    await db.execute("""
+    INSERT OR IGNORE INTO subscribers (user_tg_id, username, first_name, last_name)
+    VALUES (?, ?, ?, ?)
+    """, (user.id, user.username, user.first_name, user.last_name))
+    await db.commit()
+
+
+async def remove_subscriber(user_tg_id):
+    """Удаляет подписчика из базы данных."""
+    await db.execute("DELETE FROM subscribers WHERE user_tg_id = ?", (user_tg_id,))
+    await db.commit()
+
+
+async def log_action(user_tg_id, username, first_name, last_name, action, channel_tg_id):
+    """Логирует действие подписчика в таблицу actions."""
+    time_utc = datetime.now(timezone.utc).isoformat()
+    await db.execute("""
+    INSERT INTO actions (user_tg_id, user_tg_username, user_tg_name, user_tg_surname, action, time_utc, channel_tg_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (user_tg_id, username, first_name, last_name, action, time_utc, channel_tg_id))
+    await db.commit()
 
 # ------------------------------------------------------------------------------
 # ИНИЦИАЛИЗАЦИЯ
 # ------------------------------------------------------------------------------
+
+
 async def init_clients():
     """
     Инициализирует бота и клиентский аккаунт (пользовательский).
     """
-    global user_client, bot
+    global user_client, bot, current_channel_id
+
+    # Инициализация базы данных
+    await init_db()
 
     # Бот
     bot = TelegramClient(
@@ -48,6 +159,7 @@ async def init_clients():
         API_HASH
     )
     await bot.start(bot_token=BOT_TOKEN)
+    logging.info("Бот успешно запущен.")
 
     # Пользовательский клиент
     user_client = TelegramClient(
@@ -58,101 +170,108 @@ async def init_clients():
     # user_client не запускаем сразу через start(phone=...),
     # потому что авторизация будет через /login
     await user_client.connect()
+    logging.info("Пользовательский клиент подключён.")
 
-
-# ------------------------------------------------------------------------------
-# ОБРАБОТЧИКИ СОБЫТИЙ ДЛЯ ПОДПИСКИ/ОТПИСКИ
-# ------------------------------------------------------------------------------
-@events.register(events.ChatAction)
-async def on_chat_action(event: events.chataction.ChatAction.Event):
-    """
-    Срабатывает, когда пользователь:
-     - вступил (user_joined)
-     - вышел (user_left)
-     - был добавлен (user_added)
-     - был удалён (user_kicked)
-    и т.д.
-
-    Проверяем, что событие относится к каналу, за которым следим (current_channel_id).
-    Получаем подробную информацию о канале и пользователе, отправляем уведомление в ADMIN_CHAT_ID.
-    """
-    global current_channel_id
-
-    logging.info(
-        f"Пришло событие ChatAction event.chat_id={event.chat_id}: {event.stringify()}\n")
-
-    if current_channel_id is None:
-        return  # Канал для отслеживания не задан
-
-    if event.chat_id != current_channel_id:
-        return  # Событие не в том канале
-
-    # Если нет связи с user_client (он не авторизован) — выходим
-    if not user_client.is_connected() or not (await user_client.is_user_authorized()):
-        return
-
-    # Получаем entity канала (чтобы узнать username канала)
-    try:
-        channel_entity = await user_client.get_entity(current_channel_id)
-        channel_username = getattr(channel_entity, "username", None)
-        if not channel_username:
-            channel_username = "no_username"
-    except:
-        channel_username = "no_username"
-
-    # Выясняем, кто вступил/вышел
-    user_id = None
-    action_text = None
-    if event.user_joined or event.user_added:
-        user_id = event.user_id
-        action_text = "ПОДПИСКА"
-    elif event.user_left or event.user_kicked:
-        user_id = event.user_id
-        action_text = "ОТПИСКА"
+    # Получаем текущий канал из базы данных
+    tracked_channel = await get_tracked_channel()
+    if tracked_channel:
+        current_channel_id = tracked_channel['tg_id']
+        logging.info(
+            f"Отслеживаемый канал: {tracked_channel['name']} (@{tracked_channel['username']}) id:{tracked_channel['tg_id']}")
     else:
-        # Нас интересуют только подписка/отписка
-        return
+        logging.info(
+            "Нет отслеживаемого канала. Используйте /setchannel для установки.")
 
-    # Получаем информацию о пользователе
-    user_username = "no_username"
-    user_first_name = ""
-    user_last_name = "no_surname"
-    try:
-        user_entity = await user_client.get_entity(user_id)
-        if getattr(user_entity, "username", None):
-            user_username = user_entity.username
+# ------------------------------------------------------------------------------
+# ПОЛЛИНГ
+# ------------------------------------------------------------------------------
 
-        if getattr(user_entity, "first_name", None):
-            user_first_name = user_entity.first_name
 
-        if getattr(user_entity, "last_name", None):
-            user_last_name = user_entity.last_name
-
-    except Exception:
-        pass
-
-    # Формируем текст уведомления
-    msg = (f"Зафиксирована {action_text} от канала @{channel_username}, "
-           f"пользователь: @{user_username} {user_first_name} {user_last_name} (id{user_id})")
-
-    # Отправляем в ADMIN_CHAT_ID (если он не 0)
-    if ADMIN_CHAT_ID != 0:
+async def polling_task():
+    """
+    Фоновая задача, которая периодически проверяет подписчиков канала.
+    """
+    while True:
         try:
-            await bot.send_message(ADMIN_CHAT_ID, msg)
+            if current_channel_id is None:
+                await asyncio.sleep(POLLING_INTERVAL_SECONDS)
+                continue
+
+            if not user_client.is_connected() or not (await user_client.is_user_authorized()):
+                logging.warning(
+                    "Пользовательский клиент не авторизован. Пропуск polling.")
+                await asyncio.sleep(POLLING_INTERVAL_SECONDS)
+                continue
+
+            # Получаем текущий список подписчиков
+            participants = await user_client.get_participants(current_channel_id)
+            current_subscribers = {user.id: user for user in participants}
+
+            # Получаем предыдущий список подписчиков из базы данных
+            stored_subscribers = await get_stored_subscribers()
+
+            # Вычисляем новых подписчиков и ушедших
+            new_subscribers = {uid: user for uid, user in current_subscribers.items(
+            ) if uid not in stored_subscribers}
+            unsubscribed = {uid: info for uid, info in stored_subscribers.items(
+            ) if uid not in current_subscribers}
+
+            # Отправляем уведомления о новых подписках
+            for uid, user in new_subscribers.items():
+                username = user.username or 'no_username'
+                first_name = user.first_name or ''
+                last_name = user.last_name or 'no_surname'
+                channel_info = await get_tracked_channel()
+                channel_username = channel_info['username'] if channel_info and channel_info['username'] else 'no_username'
+                channel_name = channel_info['name'] if channel_info else 'unknown_channel'
+
+                msg = (f"Зафиксирована ПОДПИСКА от канала @{channel_username}, "
+                       f"пользователь: @{username} {first_name} {last_name} (id{uid})")
+                if ADMIN_CHAT_ID != 0:
+                    try:
+                        await bot.send_message(ADMIN_CHAT_ID, msg)
+                        logging.info(
+                            f"Отправлено уведомление о подписке пользователя id{uid}")
+                    except Exception as e:
+                        logging.error(
+                            f"Не удалось отправить уведомление о подписке: {e}")
+
+                # Добавляем нового подписчика в базу данных
+                await add_subscriber(user)
+
+                # Логируем действие
+                await log_action(uid, username, first_name, last_name, "SUBSCRIBED", current_channel_id)
+
+            # Отправляем уведомления об отписках
+            for uid, info in unsubscribed.items():
+                username = info['username'] or 'no_username'
+                first_name = info['first_name'] or ''
+                last_name = info['last_name'] or 'no_surname'
+                channel_info = await get_tracked_channel()
+                channel_username = channel_info['username'] if channel_info and channel_info['username'] else 'no_username'
+                channel_name = channel_info['name'] if channel_info else 'unknown_channel'
+
+                msg = (f"Зафиксирована ОТПИСКА от канала @{channel_username}, "
+                       f"пользователь: @{username} {first_name} {last_name} (id{uid})")
+                if ADMIN_CHAT_ID != 0:
+                    try:
+                        await bot.send_message(ADMIN_CHAT_ID, msg)
+                        logging.info(
+                            f"Отправлено уведомление об отписке пользователя id{uid}")
+                    except Exception as e:
+                        logging.error(
+                            f"Не удалось отправить уведомление об отписке: {e}")
+
+                # Удаляем подписчика из базы данных
+                await remove_subscriber(uid)
+
+                # Логируем действие
+                await log_action(uid, username, first_name, last_name, "UNSUBSCRIBED", current_channel_id)
+
         except Exception as e:
-            logging.error(
-                f"Не удалось отправить уведомление в ADMIN_CHAT_ID: {e}")
+            logging.error(f"Ошибка в polling_task: {e}")
 
-
-# ------------------------------------------------------------------------------
-# ОБРАБОТЧИКИ СОБЫТИЙ ДЛЯ ПОДПИСКИ/ОТПИСКИ
-# ------------------------------------------------------------------------------
-@events.register(events.Raw)
-async def mytest_on_update(update):
-    # Print all incoming updates
-    # logging.info(f"New update: {update.stringify()}\n\n")
-    pass
-
+        await asyncio.sleep(POLLING_INTERVAL_SECONDS)
 # ------------------------------------------------------------------------------
 # ПРОВЕРКА ДОСТУПА К КОМАНДАМ
 # ------------------------------------------------------------------------------
@@ -166,14 +285,17 @@ def admin_only(func):
     async def wrapper(event):
         if event.chat_id != ADMIN_CHAT_ID:
             # Игнорируем любые команды, пришедшие не из ADMIN_CHAT_ID
+            logging.warning(
+                f"Команда от неавторизованного чата: {event.chat_id}")
             return
         return await func(event)
     return wrapper
 
-
 # ------------------------------------------------------------------------------
 # КОМАНДЫ БОТА
 # ------------------------------------------------------------------------------
+
+
 @events.register(events.NewMessage(pattern=r'^/start$'))
 @admin_only
 async def cmd_start(event):
@@ -186,6 +308,7 @@ async def cmd_start(event):
         "/setchannel <ID> – Установить ID канала\n"
         "/getchannelid <@username> – Получить numeric ID канала по его username\n"
         "/subcount – Узнать, сколько подписчиков\n"
+        "/viewchannel – Просмотреть текущий отслеживаемый канал\n"
         "/id – Узнать текущий chat_id (или user_id)\n"
     )
     await event.respond(text)
@@ -196,7 +319,7 @@ async def cmd_start(event):
 async def cmd_login(event):
     """
     /login — Запрашиваем номер телефона и код для авторизации.
-    Вместо pattern=... используем ручную проверку результата get_response().
+    Используем conversation с ручной проверкой.
     """
     global user_client
 
@@ -206,17 +329,21 @@ async def cmd_login(event):
         return
 
     # Начинаем "conversation"
-    async with bot.conversation(event.chat_id, exclusive=False) as conv:
+    async with bot.conversation(event.chat_id, exclusive=False, timeout=300) as conv:
         await conv.send_message(
             "Окей, давайте авторизуемся. Введите номер телефона, начиная с '+':"
         )
 
         # 1) Получаем телефон
         while True:
-            phone_event = await conv.get_response()
+            try:
+                phone_event = await conv.get_response()
+            except asyncio.TimeoutError:
+                await conv.send_message("Время ожидания истекло. Попробуйте заново /login.")
+                return
+
             phone_number = phone_event.raw_text.strip()
             if phone_number.startswith('+'):
-                # Всё окей, выходим из цикла
                 break
             else:
                 await conv.send_message("Номер должен начинаться с '+'. Попробуйте ещё раз.")
@@ -234,7 +361,12 @@ async def cmd_login(event):
 
                 # 2) Получаем код (проверяем, что введены только цифры)
                 while True:
-                    code_event = await conv.get_response()
+                    try:
+                        code_event = await conv.get_response()
+                    except asyncio.TimeoutError:
+                        await conv.send_message("Время ожидания истекло. Попробуйте заново /login.")
+                        return
+
                     code = code_event.raw_text.strip()
                     if code.isdigit():
                         break
@@ -248,9 +380,13 @@ async def cmd_login(event):
                 except errors.SessionPasswordNeededError:
                     # Если включена 2FA, просим пароль
                     await conv.send_message("Введите пароль (2FA):")
-                    pass_event = await conv.get_response()
-                    password_2fa = pass_event.raw_text.strip()
+                    try:
+                        pass_event = await conv.get_response()
+                    except asyncio.TimeoutError:
+                        await conv.send_message("Время ожидания истекло. Попробуйте заново /login.")
+                        return
 
+                    password_2fa = pass_event.raw_text.strip()
                     await user_client.sign_in(password=password_2fa)
                     await conv.send_message("Успешно авторизовались (с 2FA)!")
             else:
@@ -299,8 +435,36 @@ async def cmd_setchannel(event):
     """
     global current_channel_id
     channel_id = event.pattern_match.group(1)
-    current_channel_id = int(channel_id)
-    await event.respond(f"Установлен канал для отслеживания: {current_channel_id}")
+    try:
+        channel_id = int(channel_id)
+    except ValueError:
+        await event.respond("Неверный формат ID канала. Убедитесь, что вы ввели числовой ID.")
+        return
+
+    try:
+        # Получаем информацию о канале
+        channel_entity = await user_client.get_entity(channel_id)
+        channel_name = channel_entity.title or 'no_title'
+        channel_username = channel_entity.username or 'no_username'
+    except Exception as e:
+        await event.respond(f"Не удалось получить информацию о канале: {e}")
+        return
+
+    # Устанавливаем канал для отслеживания
+    await set_tracked_channel(channel_id, channel_name, channel_username)
+    current_channel_id = channel_id
+    logging.info(
+        f"Установлен канал для отслеживания: {channel_name} (@{channel_username}) id:{channel_id}")
+
+    # Получаем текущих подписчиков и сохраняем их в базе
+    try:
+        participants = await user_client.get_participants(channel_id)
+        for user in participants:
+            await add_subscriber(user)
+        await event.respond(f"Установлен канал для отслеживания: {channel_name} (@{channel_username}) id:{channel_id}\n"
+                            f"Текущее количество подписчиков: {len(participants)}")
+    except Exception as e:
+        await event.respond(f"Не удалось получить подписчиков канала: {e}")
 
 
 @events.register(events.NewMessage(pattern=r'^/getchannelid\s+(@\S+)$'))
@@ -342,22 +506,26 @@ async def cmd_subcount(event):
     try:
         participants = await user_client.get_participants(current_channel_id)
         count = len(participants)
-        logging.info(f"Subs: {str(participants)}")
         await event.respond(f"Сейчас в канале {count} подписчиков.")
-
-        def user_to_dict(user):
-            return {
-                "id": user.id,
-                "bot": user.bot,
-                "first_name": user.first_name,
-                "last_name": user.last_name,
-                "username": user.username
-            }
-        with open('subs.json', 'w', encoding='utf-8') as f:
-            json.dump([user_to_dict(user) for user in participants],
-                      f, ensure_ascii=False, indent=4)
     except Exception as e:
         await event.respond(f"Ошибка при получении количества подписчиков: {e}")
+
+
+@events.register(events.NewMessage(pattern=r'^/viewchannel$'))
+@admin_only
+async def cmd_viewchannel(event):
+    """
+    /viewchannel — Просмотреть текущий отслеживаемый канал
+    """
+    channel_info = await get_tracked_channel()
+    if channel_info:
+        channel_username = channel_info['username'] or 'no_channel_username'
+        channel_name = channel_info['name'] or 'no_title'
+        channel_id = channel_info['tg_id']
+        msg = f"{channel_name} @{channel_username} id:{channel_id}"
+        await event.respond(msg)
+    else:
+        await event.respond("Нет установленного канала для отслеживания. Используйте /setchannel <ID>.")
 
 
 @events.register(events.NewMessage(pattern=r'^/id$'))
@@ -365,22 +533,33 @@ async def cmd_id(event):
     """
     /id — Узнать, какой chat_id (или user_id) у текущего диалога
     """
-    # При желании можно ограничить доступ декоратором @admin_only
-    # но пользовательский код выше сделан без него, поэтому оставим так
     chat_id = event.chat_id
-    # Можно вывести также id текущего отправителя
     sender = await event.get_sender()
     sender_id = sender.id if sender else "unknown_sender"
 
     await event.respond(f"Эта команда пришла из chat_id={chat_id}, ваш user_id={sender_id}")
 
-
 # ------------------------------------------------------------------------------
 # MAIN
 # ------------------------------------------------------------------------------
+
+
+async def shutdown():
+    """Корректное завершение работы бота."""
+    logging.info("Начинается процесс завершения работы...")
+    if bot:
+        await bot.disconnect()
+    if user_client:
+        await user_client.disconnect()
+    if db:
+        await db.close()
+    logging.info("Работа завершена.")
+    sys.exit(0)  # Завершаем процесс
+
+
 async def main():
     """
-    Запускаем инициализацию и «вечно» ждём событий.
+    Запускаем инициализацию, фоновую задачу polling и «вечно» ждём событий.
     """
     await init_clients()
 
@@ -392,16 +571,24 @@ async def main():
     bot.add_event_handler(cmd_setchannel)
     bot.add_event_handler(cmd_getchannelid)
     bot.add_event_handler(cmd_subcount)
+    bot.add_event_handler(cmd_viewchannel)
     bot.add_event_handler(cmd_id)
 
-    user_client.add_event_handler(mytest_on_update)
-    user_client.add_event_handler(on_chat_action)
+    # Запускаем фоновую задачу polling
+    polling = asyncio.create_task(polling_task())
+
+    # Обработка сигналов для корректного завершения
+    loop = asyncio.get_running_loop()
+    for signame in {'SIGINT', 'SIGTERM'}:
+        loop.add_signal_handler(getattr(signal, signame),
+                                lambda: asyncio.create_task(shutdown()))
 
     # Работаем вечно
     logging.info("Бот и пользовательский клиент запущены и ждут событий...")
-    await asyncio.Future()  # блокировка (вечное ожидание)
-
+    await asyncio.gather(polling)
 
 if __name__ == "__main__":
-    # Запуск для продакшена (24/7)
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logging.info("Бот остановлен пользователем.")
