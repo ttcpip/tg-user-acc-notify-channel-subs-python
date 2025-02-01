@@ -225,7 +225,7 @@ async def polling_task():
                 channel_username = channel_info['username'] if channel_info and channel_info['username'] else 'no_username'
                 channel_name = channel_info['name'] if channel_info else 'unknown_channel'
 
-                msg = (f"Зафиксирована ПОДПИСКА от канала @{channel_username}, "
+                msg = (f"Зафиксирована ПОДПИСКА на канал @{channel_username}, "
                        f"пользователь: @{username} {first_name} {last_name} (id{uid})")
                 if ADMIN_CHAT_ID != 0:
                     try:
