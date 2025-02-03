@@ -206,6 +206,7 @@ async def polling_task():
             # Получаем текущий список подписчиков
             participants = await user_client.get_participants(current_channel_id)
             current_subscribers = {user.id: user for user in participants}
+            total_subscribers = len(current_subscribers)  # Get total count
 
             # Получаем предыдущий список подписчиков из базы данных
             stored_subscribers = await get_stored_subscribers()
@@ -226,7 +227,9 @@ async def polling_task():
                 channel_name = channel_info['name'] if channel_info else 'unknown_channel'
 
                 msg = (f"Зафиксирована ПОДПИСКА на канал @{channel_username}, "
-                       f"пользователь: @{username} {first_name} {last_name} (id{uid})")
+                       f"пользователь: @{username} {first_name} {last_name} (id{uid})\n"
+                       f"Всего подписчиков: {total_subscribers}")
+
                 if ADMIN_CHAT_ID != 0:
                     try:
                         await bot.send_message(ADMIN_CHAT_ID, msg)
@@ -252,7 +255,9 @@ async def polling_task():
                 channel_name = channel_info['name'] if channel_info else 'unknown_channel'
 
                 msg = (f"Зафиксирована ОТПИСКА от канала @{channel_username}, "
-                       f"пользователь: @{username} {first_name} {last_name} (id{uid})")
+                       f"пользователь: @{username} {first_name} {last_name} (id{uid})\n"
+                       f"Всего подписчиков: {total_subscribers}")
+
                 if ADMIN_CHAT_ID != 0:
                     try:
                         await bot.send_message(ADMIN_CHAT_ID, msg)
